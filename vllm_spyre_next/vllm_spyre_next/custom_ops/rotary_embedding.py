@@ -32,6 +32,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from functools import lru_cache
+import torch.utils._pytree as pytree
 
 from .utils import convert, register_layer, get_layer, _fake_impl
 
@@ -57,16 +58,32 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         Builds cos/sin cache for position embeddings.
         """
         super().__init__(*args, **kwargs)
+        # Validate supported configurations
+        scaling_type = getattr(self, "scaling_type", "default")
+        rope_parameters = getattr(self, "rope_parameters", {}) or {}
+
+        is_supported = (
+            scaling_type == "default"
+            and "mrope_section" not in rope_parameters
+            and ("use_fope" not in rope_parameters or not rope_parameters["use_fope"])
+        )
+
+        if not is_supported:
+            raise NotImplementedError(
+                f"SpyreRotaryEmbedding only supports default scaling without mrope_section or fope."
+                f"Got scaling_type={scaling_type}, rope_parameters={rope_parameters}"
+            )
+
         logger.debug("Building custom RotaryEmbedding")
         self._target_device = torch.device("spyre")
         self._target_dtype = torch.float16
         # Build cos/sin cache on initialization
         self._build_cos_sin_cache()
         # Compile the forward kernel
-        self._fwd = self.maybe_compile(self.forward_static)
+        self.maybe_compiled_forward_spyre = self.maybe_compile(self.forward_spyre)
         self._layer_name = register_layer(self, "spyre_rotary_embedding")
         logger.warning(
-            "SpyreRotaryEmbedding: no dtype promotion is performed, "
+            "SpyreRotaryEmbedding: no dtype promotion is performed,"
             "expect numerical differences to upstream vLLM."
         )
 
@@ -94,7 +111,9 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
 
         # Compute frequencies for each position: pos * inv_freq
         # Shape: [max_position_embeddings, rotary_dim // 2]
+
         freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
 
         # Duplicate frequencies for interleaved pattern
         # Shape: [max_position_embeddings, rotary_dim]
@@ -151,7 +170,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         return torch.cat([-x2, x1], dim=-1)
 
     @staticmethod
-    def _forward_spyre_impl(
+    def forward_spyre(
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -159,7 +178,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         sin_cache: torch.Tensor,
         rotary_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Spyre-optimized RoPE computation compiled via torch.compile.
+        """Spyre-optimized RoPE computation (active implementation).
 
         Applies rotary position embeddings to query and key tensors:
         output = x * cos + rotate_half(x) * sin
@@ -192,21 +211,19 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         # Apply rotation to query and key
         # Only rotate the first rotary_dim dimensions
         query_rot = query[..., :rotary_dim]
-        query_pass = query[..., rotary_dim:]
         key_rot = key[..., :rotary_dim]
-        key_pass = key[..., rotary_dim:]
 
         # Apply RoPE: x * cos + rotate_half(x) * sin
-        query_rot = query_rot * cos + SpyreRotaryEmbedding._rotate_half(query_rot) * sin
-        key_rot = key_rot * cos + SpyreRotaryEmbedding._rotate_half(key_rot) * sin
+        query[..., :rotary_dim] = query_rot * cos + (
+            SpyreRotaryEmbedding._rotate_half(query_rot) * sin
+        )
+        key[..., :rotary_dim] = key_rot * cos + (SpyreRotaryEmbedding._rotate_half(key_rot) * sin)
 
-        # Concatenate rotated and pass-through parts
-        query = torch.cat([query_rot, query_pass], dim=-1)
-        key = torch.cat([key_rot, key_pass], dim=-1)
+        # Pass-through dimensions (rotary_dim:) remain unchanged in query and key
 
         return query, key
 
-    def forward_oot(
+    def _forward_spyre_impl(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -238,7 +255,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         #     self.sin_cache = convert(self.sin_cache, self._target_device, self._target_dtype)
 
         # Execute compiled kernel on Spyre device
-        rotated_query, rotated_key = self._fwd(
+        rotated_query, rotated_key = self.maybe_compiled_forward_spyre(
             convert(positions, self._target_device, torch.int64),
             convert(query, self._target_device, self._target_dtype),
             convert(key, self._target_device, self._target_dtype),
@@ -264,9 +281,9 @@ def _op_func(
 ) -> None:
     """Custom op implementation — runs outside torch.compile graph."""
     layer = get_layer(layer_name)
-    result_query, result_key = layer.forward_oot(positions, query, key)
-    rotated_query.copy_(result_query)
-    rotated_key.copy_(result_key)
+    result = layer._forward_spyre_impl(positions, query, key)
+    outputs = [rotated_query, rotated_key]
+    pytree.tree_map(lambda out, res: out.copy_(res), outputs, result)
 
 
 @lru_cache(maxsize=1)
